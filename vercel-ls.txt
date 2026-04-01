@@ -1,0 +1,7 @@
+Fetching deployments in chakkrapongs-projects-1781b223
+> Deployments for chakkrapongs-projects-1781b223/siam-command-ai [267ms]
+
+  Age     Project                                            Deployment                                                                   Status      Environment     Duration     Username        
+  1m      chakkrapongs-projects-1781b223/siam-command-ai     https://siam-command-caoiy14x9-chakkrapongs-projects-1781b223.vercel.app     ● Ready     Production      39s          chakkrapong     
+
+https://siam-command-caoiy14x9-chakkrapongs-projects-1781b223.vercel.app
