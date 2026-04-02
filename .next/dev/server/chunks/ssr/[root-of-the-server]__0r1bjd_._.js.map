@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "sources": [],
+  "sections": [
+    {"offset": {"line": 13, "column": 0}, "map": {"version":3,"sources":["file:///workspaces/siam-command-ai/app/favicon.ico.mjs%20%28structured%20image%20object%29"],"sourcesContent":["import src from \"IMAGE\";\nexport default { src, width: 256, height: 256 }\n"],"names":["src","width","height"],"mappings":";;;;AAAA;;uCACe;IAAEA,KAAAA,mIAAG;IAAEC,OAAO;IAAKC,QAAQ;AAAI"}},
+    {"offset": {"line": 28, "column": 0}, "map": {"version":3,"sources":["file:///workspaces/siam-command-ai/app/login/page.tsx"],"sourcesContent":["import { createClient } from \"@/utils/supabase/server\";\nimport { cookies } from \"next/headers\";\n\nexport default async function Page() {\n  const cookieStore = await cookies();\n  const supabase = createClient(cookieStore);\n\n  const { data: todos } = await supabase.from(\"todos\").select();\n\n  return (\n    <ul>\n      {todos?.map((todo) => (\n        <li key={todo.id}>{todo.name}</li>\n      ))}\n    </ul>\n  );\n}\n"],"names":["Page","cookieStore","supabase","createClient","data","todos","from","select","map","todo","name","id"],"mappings":";;;;;;;;;;AACA;;;;AAEe,eAAeA;IAC5B,MAAMC,cAAc,MAAM,IAAA,0IAAO;IACjC,MAAMC,WAAWC,aAAaF;IAE9B,MAAM,EAAEG,MAAMC,KAAK,EAAE,GAAG,MAAMH,SAASI,IAAI,CAAC,SAASC,MAAM;IAE3D,qBACE,8OAAC;kBACEF,OAAOG,IAAI,CAACC,qBACX,8OAAC;0BAAkBA,KAAKC,IAAI;eAAnBD,KAAKE,EAAE;;;;;;;;;;AAIxB"}}]
+}
