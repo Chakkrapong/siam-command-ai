@@ -1,0 +1,54 @@
+{
+  "subsystems": [
+    {
+      "name": "Claw Core Runtime",
+      "owner": "Claw Core",
+      "role": "runtime, routing, session loop, command/tool execution substrate",
+      "path": "src/runtime.py",
+      "status": "active"
+    },
+    {
+      "name": "Claw Command Inventory",
+      "owner": "Claw Core",
+      "role": "mirrored command registry surface",
+      "path": "src/commands.py",
+      "status": "active"
+    },
+    {
+      "name": "Claw Tool Inventory",
+      "owner": "Claw Core",
+      "role": "mirrored tool registry surface",
+      "path": "src/tools.py",
+      "status": "active"
+    },
+    {
+      "name": "Claw Session Store",
+      "owner": "Claw Core",
+      "role": "persist/reload session state",
+      "path": "src/session_store.py",
+      "status": "active"
+    },
+    {
+      "name": "Siam Command Control Layer",
+      "owner": "Siam Command",
+      "role": "dashboard/control/policy/manual override wrapper",
+      "path": "src/siam_command/control_layer.py",
+      "status": "active"
+    },
+    {
+      "name": "Techin Routing Authority",
+      "owner": "Techin",
+      "role": "routing policy and command/tool decision authority",
+      "path": "src/siam_command/policy.py",
+      "status": "active"
+    },
+    {
+      "name": "MusicGen Adapter Contract",
+      "owner": "MusicGen",
+      "role": "domain-tool adapter interface and deferred mount contract",
+      "path": "src/siam_command/musicgen.py",
+      "status": "planned"
+    }
+  ]
+}
+

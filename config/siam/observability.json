@@ -1,0 +1,5 @@
+{
+  "persist_execution_logs": true,
+  "execution_log_jsonl_path": ".siam/execution-log.jsonl"
+}
+

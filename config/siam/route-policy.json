@@ -1,0 +1,62 @@
+{
+  "policy_name": "techin-default-v1",
+  "max_candidates": 6,
+  "kind_priority": [
+    "command",
+    "tool"
+  ],
+  "default_command_fallback": "good-claw",
+  "keyword_rules": [
+    {
+      "contains": [
+        "review",
+        "audit",
+        "security"
+      ],
+      "prefer_commands": [
+        "review",
+        "bughunter"
+      ],
+      "prefer_tools": [
+        "verificationAgent",
+        "MCPTool"
+      ]
+    },
+    {
+      "contains": [
+        "agent",
+        "delegate",
+        "parallel"
+      ],
+      "prefer_commands": [
+        "agents"
+      ],
+      "prefer_tools": [
+        "AgentTool"
+      ]
+    },
+    {
+      "contains": [
+        "session",
+        "context",
+        "memory"
+      ],
+      "prefer_commands": [
+        "context",
+        "compact"
+      ],
+      "prefer_tools": [
+        "MCPTool",
+        "FileReadTool"
+      ]
+    }
+  ],
+  "manual_override_defaults": {
+    "mode": "normal",
+    "allow_commands": [],
+    "block_commands": [],
+    "allow_tools": [],
+    "block_tools": []
+  }
+}
+

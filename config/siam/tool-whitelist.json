@@ -1,0 +1,15 @@
+{
+  "allowed_tools": [
+    "AgentTool",
+    "MCPTool",
+    "FileReadTool",
+    "FileEditTool",
+    "BashTool",
+    "WebFetchTool",
+    "Task",
+    "TodoWrite",
+    "AskUserQuestionTool",
+    "verificationAgent"
+  ]
+}
+
