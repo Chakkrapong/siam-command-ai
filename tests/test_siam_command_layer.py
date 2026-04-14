@@ -10,6 +10,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from src.siam_command import ManualOverrideModel, SiamCommandControlLayer
+from src.siam_command.infrastructure.bootstrap import build_control_plane_ports
+from src.siam_command.infrastructure.settings import SiamInfrastructureSettings
 from src.siam_command.models import RouteDecisionModel
 from src.siam_core.runtime_guardrail import GuardrailStatus
 from src.siam_core.runtime_phase4 import Phase4RuntimeConfig, PromotionGovernance
@@ -118,6 +120,12 @@ class SiamCommandLayerTests(unittest.TestCase):
         self.assertGreaterEqual(health.tool_count, 50)
         self.assertGreaterEqual(health.allowed_tool_count, 1)
 
+    def test_layer_accepts_injected_ports_from_container(self) -> None:
+        settings = SiamInfrastructureSettings()
+        ports = build_control_plane_ports(settings)
+        layer = SiamCommandControlLayer(ports=ports, infrastructure_settings=settings)
+        self.assertIs(layer._ports, ports)
+
     def test_tool_whitelist_filters_available_tools(self) -> None:
         layer = SiamCommandControlLayer.from_defaults()
         available = set(name.lower() for name in layer.list_available_tools())
@@ -213,6 +221,26 @@ class SiamCommandLayerTests(unittest.TestCase):
         self.assertEqual(state["path"], self._log_path)
         self.assertEqual(state["enabled"], True)
 
+    def test_persisted_execution_logs_reads_from_execution_run_port(self) -> None:
+        layer = SiamCommandControlLayer.from_defaults()
+        expected = [{"execution_id": "run_1"}, {"execution_id": "run_2"}]
+        with patch.object(layer._execution_runs, "list_runs", return_value=expected) as list_runs, patch.object(
+            layer._log_store, "read_all", side_effect=AssertionError("legacy log store should not be used")
+        ):
+            persisted = layer.persisted_execution_logs()
+        list_runs.assert_called_once_with({}, limit=1000000)
+        self.assertEqual(persisted, tuple(expected))
+
+    def test_persisted_execution_logs_falls_back_to_legacy_store_when_port_fails(self) -> None:
+        layer = SiamCommandControlLayer.from_defaults()
+        fallback_records = [{"execution_id": "legacy_1"}]
+        with patch.object(layer._execution_runs, "list_runs", side_effect=RuntimeError("port unavailable")), patch.object(
+            layer._log_store, "read_all", return_value=fallback_records
+        ) as read_all:
+            persisted = layer.persisted_execution_logs()
+        read_all.assert_called_once()
+        self.assertEqual(persisted, tuple(fallback_records))
+
     def test_persistence_disabled_does_not_write_log_file(self) -> None:
         disabled_path = Path(self._tmpdir.name) / "disabled-execution-log.jsonl"
         old_persist = os.environ.get("SIAM_PERSIST_EXECUTION_LOGS")
@@ -285,13 +313,43 @@ class SiamCommandLayerTests(unittest.TestCase):
         self.assertEqual(log.shadow_event, "shadow_match")
         self.assertTrue((log.shadow_meta or {}).get("match"))
 
-    def test_shadow_exception_is_swallowed(self) -> None:
+    def test_shadow_executor_exception_recovers_for_review_path(self) -> None:
         layer = SiamCommandControlLayer.from_defaults()
         decision = RouteDecisionModel(
             prompt="review prompt",
             selected_command="review",
             selected_tool=None,
             candidate_commands=("review",),
+            candidate_tools=(),
+            blocked_commands=(),
+            blocked_tools=(),
+            reason="test",
+            policy_name="techin-default-v1",
+        )
+        legacy_message = "Mirrored command 'review' from commands/review.ts would handle prompt 'review prompt'."
+        layer._runtime_v2_execution_registry = _FakeRegistry(_FakeExecutable(legacy_message))
+        with patch.object(layer, "apply_route_policy", return_value=decision), patch(
+            "src.siam_command.control_layer.execute_shadow_for_command",
+            side_effect=RuntimeError("shadow crash"),
+        ), patch(
+            "src.siam_command.control_layer.phase4_runtime_config",
+            return_value=_phase4_config(runtime_v2_enabled=False, default_route_split=0),
+        ):
+            log = layer.execute_with_control("review prompt")
+        self.assertFalse(log.blocked)
+        self.assertIsNotNone(log.command_message)
+        self.assertEqual(log.shadow_event, "shadow_match")
+        self.assertEqual((log.shadow_meta or {}).get("recovered_from"), "shadow_executor_exception")
+        self.assertEqual((log.shadow_meta or {}).get("command_name"), "review")
+        self.assertNotEqual((log.shadow_meta or {}).get("shadow_event"), "shadow_error")
+
+    def test_non_review_shadow_path_remains_skipped_and_unchanged(self) -> None:
+        layer = SiamCommandControlLayer.from_defaults()
+        decision = RouteDecisionModel(
+            prompt="logout prompt",
+            selected_command="logout",
+            selected_tool=None,
+            candidate_commands=("logout",),
             candidate_tools=(),
             blocked_commands=(),
             blocked_tools=(),
@@ -305,11 +363,40 @@ class SiamCommandLayerTests(unittest.TestCase):
             "src.siam_command.control_layer.phase4_runtime_config",
             return_value=_phase4_config(runtime_v2_enabled=False, default_route_split=0),
         ):
+            log = layer.execute_with_control("logout prompt")
+        self.assertFalse(log.blocked)
+        self.assertEqual(log.shadow_event, "shadow_skipped")
+        self.assertEqual((log.shadow_meta or {}).get("reason"), "command_not_allowlisted")
+
+    def test_review_shadow_recovery_failure_still_swallowed_with_structured_error(self) -> None:
+        layer = SiamCommandControlLayer.from_defaults()
+        decision = RouteDecisionModel(
+            prompt="review prompt",
+            selected_command="review",
+            selected_tool=None,
+            candidate_commands=("review",),
+            candidate_tools=(),
+            blocked_commands=(),
+            blocked_tools=(),
+            reason="test",
+            policy_name="techin-default-v1",
+        )
+        layer._runtime_v2_execution_registry = _FakeRegistry(_FakeExecutable(error=RuntimeError("v2 shadow recovery failed")))
+        with patch.object(layer, "apply_route_policy", return_value=decision), patch(
+            "src.siam_command.control_layer.execute_shadow_for_command",
+            side_effect=RuntimeError("shadow crash"),
+        ), patch(
+            "src.siam_command.control_layer.phase4_runtime_config",
+            return_value=_phase4_config(runtime_v2_enabled=False, default_route_split=0),
+        ):
             log = layer.execute_with_control("review prompt")
         self.assertFalse(log.blocked)
-        self.assertIsNotNone(log.command_message)
         self.assertEqual(log.shadow_event, "shadow_error")
-        self.assertEqual((log.shadow_meta or {}).get("reason"), "shadow_runtime_exception")
+        self.assertEqual((log.shadow_meta or {}).get("reason"), "unknown_runtime_error")
+        self.assertEqual((log.shadow_meta or {}).get("failure_stage"), "during_adapter_execution")
+        self.assertEqual((log.shadow_meta or {}).get("error_class"), "RuntimeError")
+        self.assertEqual((log.shadow_meta or {}).get("error_kind"), "runtime_exception")
+        self.assertIn("unknown_runtime_error:", str((log.shadow_meta or {}).get("error") or ""))
 
     def test_shadow_enabled_non_safe_command_is_logged_as_skipped(self) -> None:
         layer = SiamCommandControlLayer.from_defaults()
@@ -403,6 +490,39 @@ class SiamCommandLayerTests(unittest.TestCase):
         self.assertEqual(log.runtime_v2_route_event, "fallback_legacy")
         self.assertEqual((log.runtime_v2_route_meta or {}).get("reason"), "contract_failed")
         self.assertTrue(((log.runtime_v2_route_meta or {}).get("runtime_execution") or {}).get("fallback"))
+
+    def test_partial_routing_normalizes_review_placeholder_payload_to_avoid_false_fallback(self) -> None:
+        layer = SiamCommandControlLayer.from_defaults()
+        decision = RouteDecisionModel(
+            prompt="review prompt",
+            selected_command="review",
+            selected_tool=None,
+            candidate_commands=("review",),
+            candidate_tools=(),
+            blocked_commands=(),
+            blocked_tools=(),
+            reason="test",
+            policy_name="techin-default-v1",
+        )
+        legacy_message = "Mirrored command 'review' from commands/review.ts would handle prompt 'review prompt'."
+        layer._legacy_execution_registry = _FakeRegistry(_FakeExecutable(legacy_message))
+        layer._runtime_v2_execution_registry = _FakeRegistry(_FakeExecutable("v2"))
+        with patch.object(layer, "apply_route_policy", return_value=decision), patch(
+            "src.siam_command.control_layer.phase4_runtime_config",
+            return_value=_phase4_config(runtime_v2_enabled=True, default_route_split=100),
+        ), patch(
+            "src.siam_command.control_layer.assess_runtime_risk",
+            return_value=_low_risk(),
+        ), patch(
+            "src.siam_command.control_layer.evaluate_v2_guardrail",
+            return_value=_healthy_guardrail(),
+        ):
+            log = layer.execute_with_control("review prompt")
+        self.assertEqual(log.command_message, legacy_message)
+        self.assertEqual(log.runtime_v2_route_event, "routed_v2")
+        self.assertEqual((log.runtime_v2_route_meta or {}).get("reason"), "contract_passed")
+        self.assertEqual(((log.runtime_v2_route_meta or {}).get("runtime_execution") or {}).get("served_runtime"), "v2")
+        self.assertFalse(((log.runtime_v2_route_meta or {}).get("runtime_execution") or {}).get("fallback"))
 
     def test_partial_routing_falls_back_on_v2_error(self) -> None:
         layer = SiamCommandControlLayer.from_defaults()
@@ -547,6 +667,29 @@ class SiamCommandLayerTests(unittest.TestCase):
         self.assertEqual(log.runtime_v2_route_event, "legacy_default")
         self.assertEqual(((log.runtime_v2_route_meta or {}).get("runtime_decision") or {}).get("reason"), "risk_blocked_streaming_not_supported")
         self.assertEqual(((log.runtime_v2_route_meta or {}).get("runtime_decision") or {}).get("risk_level"), "high")
+
+    def test_review_intent_prompts_do_not_drift_to_default_family_without_explanation(self) -> None:
+        layer = SiamCommandControlLayer.from_defaults()
+        prompts = (
+            "review MCP tool permissions",
+            "review system status",
+            "please review route policy",
+            "review logs for anomalies",
+            "audit MCP permissions",
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                log = layer.execute_with_control(prompt, payload="phase42-review-drift-check")
+                runtime_decision = ((log.runtime_v2_route_meta or {}).get("runtime_decision") or {})
+                state_source = str(runtime_decision.get("governance_source") or "")
+                fallback_reason = runtime_decision.get("fallback_reason")
+
+                self.assertEqual(runtime_decision.get("intent_family"), "review")
+                self.assertEqual(runtime_decision.get("route_family"), "review")
+                self.assertTrue(
+                    state_source != "default_policy" or bool(fallback_reason),
+                    msg=f"prompt={prompt!r} must not silently stay on default_policy without explanation",
+                )
 
 
 if __name__ == "__main__":

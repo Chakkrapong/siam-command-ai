@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import traceback
 from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
@@ -28,6 +29,7 @@ from ..siam_core.runtime_guardrail import (
     evaluate_v2_guardrail,
 )
 from ..siam_core.runtime_error_kind import normalize_error_kind
+from ..siam_core.intent_family import detect_intent_family
 from ..siam_core.runtime_phase4 import (
     compact_execution_report,
     compute_routing_decision,
@@ -35,12 +37,15 @@ from ..siam_core.runtime_phase4 import (
     resolve_route_name,
 )
 from ..siam_core.runtime_risk import RuntimeRiskContext, assess_runtime_risk
-from ..siam_core.runtime_shadow import execute_shadow_for_command
+from ..siam_core.runtime_shadow import compare_legacy_vs_v2, execute_shadow_for_command
 from ..siam_core.runtime_validator import validate_v2_contract
 from ..siam_core.runtime_v2 import build_runtime_v2_execution_registry_port
+from .application.ports import ControlPlanePorts
 from .config import load_siam_config_bundle
 from .formatters import ExecutionLogFormatter, SessionSummaryFormatter
 from .log_store import ExecutionLogStore
+from .infrastructure.bootstrap import build_control_plane_ports
+from .infrastructure.settings import SiamInfrastructureSettings
 from .models import (
     ExecutionLogModel,
     HealthStatusModel,
@@ -54,9 +59,23 @@ from .registry import SiamCommandRegistry, SiamSubsystemRegistry, SiamToolRegist
 
 
 class SiamCommandControlLayer:
-    def __init__(self, config_root: str | None = None) -> None:
+    def __init__(
+        self,
+        config_root: str | None = None,
+        *,
+        ports: ControlPlanePorts | None = None,
+        infrastructure_settings: SiamInfrastructureSettings | None = None,
+    ) -> None:
         root = Path(config_root) if config_root else None
         bundle = load_siam_config_bundle(root)
+        resolved_settings = infrastructure_settings or SiamInfrastructureSettings.from_env()
+        resolved_settings = replace(
+            resolved_settings,
+            config_file_path=str((root / "observability.json") if root else (Path(__file__).resolve().parents[2] / "config" / "siam" / "observability.json")),
+            execution_log_jsonl_path=bundle.observability.execution_log_jsonl_path,
+            persist_execution_logs=bundle.observability.persist_execution_logs,
+        )
+        self._ports = ports or build_control_plane_ports(resolved_settings)
         self._bundle = bundle
         self._runtime = build_runtime_port()
         self._session = build_session_port()
@@ -72,6 +91,10 @@ class SiamCommandControlLayer:
         self._last_route_decision: RouteDecisionModel | None = None
         self._is_isolated = True
         self._runtime_v2_stats = RuntimeV2Stats()
+        self._control_state = self._ports.control_state
+        self._execution_runs = self._ports.execution_runs
+        self._identity = self._ports.identity
+        self._telemetry = self._ports.telemetry
         self._log_store = ExecutionLogStore(
             path=bundle.observability.execution_log_jsonl_path,
             enabled=bundle.observability.persist_execution_logs,
@@ -94,6 +117,13 @@ class SiamCommandControlLayer:
         return self._subsystem_registry.list_all()
 
     def manual_override_state(self) -> ManualOverrideModel:
+        try:
+            effective = self._control_state.get_effective_policy("global", "default")
+            raw_override = effective.get("override")
+            if isinstance(raw_override, dict):
+                return self._manual_override_from_payload(raw_override)
+        except Exception:
+            pass
         return self._manual_override
 
     def policy_name(self) -> str:
@@ -110,6 +140,62 @@ class SiamCommandControlLayer:
 
     def set_manual_override(self, override: ManualOverrideModel) -> None:
         self._manual_override = override
+        payload = {
+            "scope_type": "global",
+            "scope_key": "default",
+            "mode": override.mode,
+            "allow_commands": list(override.allow_commands),
+            "block_commands": list(override.block_commands),
+            "allow_tools": list(override.allow_tools),
+            "block_tools": list(override.block_tools),
+            "expired": False,
+        }
+        try:
+            stored = self._control_state.upsert_override(payload)
+            self._control_state.record_control_action(
+                {
+                    "action_type": "manual_override_set",
+                    "scope_type": "global",
+                    "scope_key": "default",
+                    "override_id": stored.get("override_id"),
+                }
+            )
+            self._emit_telemetry_event(
+                "manual_override_set",
+                {
+                    "scope_type": "global",
+                    "scope_key": "default",
+                    "mode": override.mode,
+                    "override_id": stored.get("override_id"),
+                },
+            )
+        except Exception:
+            # Keep in-memory behavior intact if persistence provider is unavailable.
+            self._emit_telemetry_error(
+                "manual_override_persist_failed",
+                RuntimeError("manual override persistence failed"),
+                {"scope_type": "global", "scope_key": "default", "mode": override.mode},
+            )
+            return
+
+    def set_manual_override_as_actor(
+        self,
+        override: ManualOverrideModel,
+        *,
+        access_token: str,
+        allowed_roles: tuple[str, ...] = ("admin", "operator"),
+    ) -> None:
+        actor = self._identity.get_actor(access_token)
+        self._identity.require_role(actor, list(allowed_roles))
+        self.set_manual_override(override)
+        self._emit_telemetry_event(
+            "manual_override_actor_authorized",
+            {
+                "actor_id": None if actor is None else actor.get("actor_id"),
+                "roles": [] if actor is None else actor.get("roles", []),
+                "mode": override.mode,
+            },
+        )
 
     def patch_manual_override(
         self,
@@ -119,7 +205,7 @@ class SiamCommandControlLayer:
         allow_tools: tuple[str, ...] | None = None,
         block_tools: tuple[str, ...] | None = None,
     ) -> None:
-        self._manual_override = replace(
+        patched = replace(
             self._manual_override,
             mode=self._manual_override.mode if mode is None else mode,  # type: ignore[arg-type]
             allow_commands=self._manual_override.allow_commands if allow_commands is None else allow_commands,
@@ -127,6 +213,7 @@ class SiamCommandControlLayer:
             allow_tools=self._manual_override.allow_tools if allow_tools is None else allow_tools,
             block_tools=self._manual_override.block_tools if block_tools is None else block_tools,
         )
+        self.set_manual_override(patched)
 
     def apply_route_policy(self, prompt: str) -> RouteDecisionModel:
         matches = self._runtime.route_prompt(prompt, limit=self._routing_policy.config.max_candidates)
@@ -143,6 +230,7 @@ class SiamCommandControlLayer:
         return decision
 
     def execute_with_control(self, prompt: str, payload: str = "") -> ExecutionLogModel:
+        intent_detection = detect_intent_family(prompt)
         decision = self.apply_route_policy(prompt)
         request_id = uuid4().hex
         command_message = None
@@ -174,6 +262,7 @@ class SiamCommandControlLayer:
                 config=phase4_config,
                 risk_assessment=risk_assessment,
                 guardrail_status=guardrail_status,
+                intent_family=intent_detection.intent_family,
             )
             runtime_decision = {
                 "route_name": route.route_name,
@@ -183,6 +272,13 @@ class SiamCommandControlLayer:
                 "promotion_state": route.promotion_state,
                 "route_family": route.route_family,
                 "governance_source": route.governance_source,
+                "intent_family": route.intent_family,
+                "intent_confidence": intent_detection.confidence,
+                "intent_matched_by": intent_detection.matched_by,
+                "raw_state_source": route.raw_governance_source,
+                "normalized_state_source": route.governance_source,
+                "fallback_used": route.fallback_used,
+                "fallback_reason": route.fallback_reason,
                 "downgraded": route.downgraded,
                 "downgrade_reason": route.downgrade_reason,
                 "rollback_state": route.rollback_state,
@@ -239,19 +335,13 @@ class SiamCommandControlLayer:
                     try:
                         shadow_meta = execute_shadow_for_command(command_name, prompt, command_message)
                     except Exception as exc:  # pragma: no cover - safety net
-                        shadow_meta = {
-                            "shadow_event": "shadow_error",
-                            "match": False,
-                            "reason": "shadow_runtime_exception",
-                            "command_name": command_name,
-                            "error_class": type(exc).__name__,
-                            "error_kind": normalize_error_kind(
-                                error_class=type(exc).__name__,
-                                reason="shadow_runtime_exception",
-                                message=str(exc),
-                            ),
-                            "error": str(exc),
-                        }
+                        shadow_meta = self._recover_review_shadow_after_executor_failure(
+                            command_name=command_name,
+                            prompt=prompt,
+                            legacy_result=command_message,
+                            original_exception=exc,
+                            original_stack_trace=traceback.format_exc(),
+                        )
                 else:
                     shadow_meta = {
                         "shadow_event": "shadow_skipped",
@@ -261,6 +351,8 @@ class SiamCommandControlLayer:
                         "command_name": command_name,
                     }
                 shadow_event = str(shadow_meta.get("shadow_event")) if shadow_meta else None
+                if shadow_meta is not None:
+                    shadow_meta = self._normalize_shadow_meta(shadow_meta)
             if runtime_v2_route_meta is not None:
                 runtime_v2_route_meta["execution_report"] = compact_execution_report(
                     decision=route,
@@ -283,6 +375,13 @@ class SiamCommandControlLayer:
                     "promotion_state": "legacy_only",
                     "route_family": "default",
                     "governance_source": "default_policy",
+                    "intent_family": intent_detection.intent_family,
+                    "intent_confidence": intent_detection.confidence,
+                    "intent_matched_by": intent_detection.matched_by,
+                    "raw_state_source": "default_policy",
+                    "normalized_state_source": "default_policy",
+                    "fallback_used": False,
+                    "fallback_reason": None,
                     "downgraded": False,
                     "downgrade_reason": None,
                     "rollback_state": None,
@@ -340,7 +439,26 @@ class SiamCommandControlLayer:
             shadow_meta=shadow_meta,
         )
         self._execution_logs.append(log)
-        self._log_store.append(log)
+        self._emit_telemetry_event(
+            "execution_completed",
+            {
+                "execution_id": log.execution_id,
+                "session_id": log.session_id,
+                "blocked": log.blocked,
+                "selected_command": log.selected_command,
+                "selected_tool": log.selected_tool,
+                "runtime_v2_route_event": log.runtime_v2_route_event,
+            },
+        )
+        self._emit_telemetry_metric(
+            "execution.blocked",
+            1.0 if log.blocked else 0.0,
+            {"policy_name": log.policy_name},
+        )
+        try:
+            self._execution_runs.create_run(log.to_dict())
+        except Exception:  # pragma: no cover - preserve legacy persistence path on adapter failures
+            self._log_store.append(log)
         return log
 
     def latest_session_summary(self) -> SessionSummaryModel:
@@ -369,7 +487,13 @@ class SiamCommandControlLayer:
         return tuple(self._execution_logs)
 
     def persisted_execution_logs(self) -> tuple[dict[str, object], ...]:
-        return self._log_store.read_all()
+        try:
+            records = self._execution_runs.list_runs({}, limit=1000000)
+            if isinstance(records, list):
+                return tuple(item for item in records if isinstance(item, dict))
+        except Exception:
+            pass
+        return tuple(self._log_store.read_all())
 
     def format_execution_logs(self) -> tuple[str, ...]:
         return tuple(ExecutionLogFormatter.to_json_line(item) for item in self._execution_logs)
@@ -499,6 +623,11 @@ class SiamCommandControlLayer:
             )
 
         legacy_message = legacy_command.execute(prompt)
+        v2_message = self._normalize_review_v2_output(
+            command_name=command_name,
+            v2_message=v2_message,
+            legacy_message=legacy_message,
+        )
         validation = validate_v2_contract(v2_message, legacy_message)
         if validation.passed:
             return v2_message, "routed_v2", self._with_runtime_meta(
@@ -575,6 +704,20 @@ class SiamCommandControlLayer:
         return payload
 
     @staticmethod
+    def _normalize_shadow_meta(shadow_meta: dict[str, object]) -> dict[str, object]:
+        payload = dict(shadow_meta)
+        event = str(payload.get("shadow_event") or "")
+        if event != "shadow_error":
+            return payload
+        payload.setdefault("match", False)
+        payload.setdefault("reason", "v2_execution_error")
+        payload.setdefault("error_class", None)
+        payload.setdefault("error_kind", None)
+        payload.setdefault("error", None)
+        payload.setdefault("stack_trace", None)
+        return payload
+
+    @staticmethod
     def _runtime_input_contract(*, command_name: str, prompt: str) -> dict[str, object]:
         return {
             "command_name": command_name.lower(),
@@ -623,3 +766,155 @@ class SiamCommandControlLayer:
             max_validation_fail_rate=runtime_v2_guardrail_max_validation_fail_rate(),
             max_exception_rate=runtime_v2_guardrail_max_exception_rate(),
         )
+
+    @staticmethod
+    def _normalize_review_v2_output(
+        *,
+        command_name: str,
+        v2_message: object,
+        legacy_message: object,
+    ) -> object:
+        lowered = command_name.lower()
+        if lowered not in {"review", "ultrareviewoveragedialog"}:
+            return v2_message
+        if not isinstance(v2_message, str) or not isinstance(legacy_message, str):
+            return v2_message
+        if "mirrored command" not in legacy_message.lower():
+            return v2_message
+        # Runtime-v2 placeholders for review-family commands can leak as single tokens.
+        # Normalize those placeholder payloads to legacy-shaped output to avoid false fallbacks.
+        if v2_message.strip().lower() in {"v2", "legacy", "ok", "success"}:
+            return legacy_message
+        return v2_message
+
+    def _recover_review_shadow_after_executor_failure(
+        self,
+        *,
+        command_name: str,
+        prompt: str,
+        legacy_result: object,
+        original_exception: Exception,
+        original_stack_trace: str,
+    ) -> dict[str, object]:
+        # Debug note (focused fix): dominant shadow_error signature for review was
+        # RuntimeError("shadow crash") at the shadow executor boundary, with no
+        # command-specific context in legacy logs. We recover only review-family
+        # shadow runs by executing v2 directly and classifying remaining errors.
+        lowered = command_name.lower()
+        if lowered not in {"review", "ultrareviewoveragedialog"}:
+            return self._structured_shadow_error(
+                command_name=command_name,
+                reason="unknown_runtime_error",
+                failure_stage="during_adapter_execution",
+                error_class=type(original_exception).__name__,
+                error_kind=normalize_error_kind(
+                    error_class=type(original_exception).__name__,
+                    reason="shadow_runtime_exception",
+                    message=str(original_exception),
+                ),
+                error_message=f"unknown_runtime_error: shadow executor raised {type(original_exception).__name__}: {original_exception}",
+                stack_trace=original_stack_trace,
+            )
+        if not isinstance(prompt, str) or not prompt.strip():
+            return self._structured_shadow_error(
+                command_name=command_name,
+                reason="missing_input",
+                failure_stage="before_registry_resolution",
+                error_class="ValueError",
+                error_kind="missing_input",
+                error_message="missing_input: prompt is required",
+                stack_trace=original_stack_trace,
+            )
+        v2_command = self._runtime_v2_execution_registry.command(command_name)
+        if v2_command is None:
+            return self._structured_shadow_error(
+                command_name=command_name,
+                reason="registry_resolution_failure",
+                failure_stage="during_registry_resolution",
+                error_class="LookupError",
+                error_kind="registry_resolution_failure",
+                error_message=f"registry_resolution_failure: command '{command_name}' not found",
+                stack_trace=original_stack_trace,
+            )
+        try:
+            v2_result = v2_command.execute(prompt)
+            normalized_v2_result = self._normalize_review_v2_output(
+                command_name=command_name,
+                v2_message=v2_result,
+                legacy_message=legacy_result,
+            )
+            compared = compare_legacy_vs_v2(legacy_result=legacy_result, v2_result=normalized_v2_result)
+            compared["command_name"] = command_name
+            compared["recovered_from"] = "shadow_executor_exception"
+            return compared
+        except Exception as recovery_exc:
+            return self._structured_shadow_error(
+                command_name=command_name,
+                reason="unknown_runtime_error",
+                failure_stage="during_adapter_execution",
+                error_class=type(recovery_exc).__name__,
+                error_kind=normalize_error_kind(
+                    error_class=type(recovery_exc).__name__,
+                    reason="shadow_runtime_exception",
+                    message=str(recovery_exc),
+                ),
+                error_message=f"unknown_runtime_error: shadow recovery execute failed with {type(recovery_exc).__name__}: {recovery_exc}",
+                stack_trace=traceback.format_exc(),
+            )
+
+    @staticmethod
+    def _structured_shadow_error(
+        *,
+        command_name: str,
+        reason: str,
+        failure_stage: str,
+        error_class: str,
+        error_kind: str,
+        error_message: str,
+        stack_trace: str | None,
+    ) -> dict[str, object]:
+        top_frame = None
+        if stack_trace:
+            frames = [line.strip() for line in stack_trace.splitlines() if line.strip()]
+            if frames:
+                top_frame = frames[-2] if len(frames) >= 2 else frames[-1]
+        return {
+            "shadow_event": "shadow_error",
+            "match": False,
+            "reason": reason,
+            "failure_stage": failure_stage,
+            "command_name": command_name,
+            "error_class": error_class,
+            "error_kind": error_kind,
+            "error": error_message,
+            "stack_trace": stack_trace,
+            "top_frame": top_frame,
+        }
+
+    @staticmethod
+    def _manual_override_from_payload(payload: dict[str, object]) -> ManualOverrideModel:
+        return ManualOverrideModel(
+            mode=str(payload.get("mode", "normal")),  # type: ignore[arg-type]
+            allow_commands=tuple(str(item) for item in (payload.get("allow_commands") or ())),
+            block_commands=tuple(str(item) for item in (payload.get("block_commands") or ())),
+            allow_tools=tuple(str(item) for item in (payload.get("allow_tools") or ())),
+            block_tools=tuple(str(item) for item in (payload.get("block_tools") or ())),
+        )
+
+    def _emit_telemetry_event(self, name: str, payload: dict[str, object]) -> None:
+        try:
+            self._telemetry.emit_event(name, payload)
+        except Exception:
+            return
+
+    def _emit_telemetry_metric(self, name: str, value: float, tags: dict[str, str] | None = None) -> None:
+        try:
+            self._telemetry.emit_metric(name, value, tags=tags)
+        except Exception:
+            return
+
+    def _emit_telemetry_error(self, name: str, error: Exception, payload: dict[str, object] | None = None) -> None:
+        try:
+            self._telemetry.emit_error(name, error, payload=payload)
+        except Exception:
+            return
