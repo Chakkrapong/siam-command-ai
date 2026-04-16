@@ -3,9 +3,14 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 
-from .control_layer import SiamCommandControlLayer
 from .models import ManualOverrideModel
 from .observation_report import build_observation_window_report
+from .safe_primitives import (
+    build_monitoring_snapshot_view,
+    build_operator_report,
+    build_review_surface,
+    compute_state_check,
+)
 from .serializers import SiamOutputSerializer
 
 
@@ -46,6 +51,19 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="optional path to execution jsonl log file (defaults to configured observability path)",
     )
+    safe_state_check = subparsers.add_parser("safe-state-check", help="read-only safe state snapshot")
+    safe_state_check.add_argument("--log-path", default=".siam/execution-log.jsonl")
+    safe_state_check.add_argument("--window", type=int, default=50)
+    safe_review_surface = subparsers.add_parser("safe-review-surface", help="read-only safe review surface")
+    safe_review_surface.add_argument("--log-path", default=".siam/execution-log.jsonl")
+    safe_review_surface.add_argument("--tail", type=int, default=5)
+    safe_operator_report = subparsers.add_parser("safe-operator-report", help="read-only safe operator report")
+    safe_operator_report.add_argument("--log-path", default=".siam/execution-log.jsonl")
+    safe_operator_report.add_argument("--tail", type=int, default=5)
+    safe_monitoring_view = subparsers.add_parser("safe-monitoring-view", help="read-only safe monitoring view")
+    safe_monitoring_view.add_argument("--log-path", default=".siam/execution-log.jsonl")
+    safe_monitoring_view.add_argument("--readiness-path", default=".siam/readiness_snapshot.json")
+    safe_monitoring_view.add_argument("--alerts-path", default=".siam/alerts_snapshot.json")
     subparsers.add_parser("session", help="show latest session summary")
     subparsers.add_parser("logs", help="show structured execution logs")
     subparsers.add_parser("control-state", help="show policy, whitelist, override, and persistence state")
@@ -56,6 +74,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     output_mode = args.output
+    if args.command == "safe-state-check":
+        payload = compute_state_check(args.log_path, window=max(1, int(args.window)))
+        print(SiamOutputSerializer.emit(payload, output_mode))
+        return 0
+    if args.command == "safe-review-surface":
+        payload = build_review_surface(args.log_path, tail=max(0, int(args.tail)))
+        print(SiamOutputSerializer.emit(payload, output_mode))
+        return 0
+    if args.command == "safe-operator-report":
+        payload = build_operator_report(args.log_path, tail=max(0, int(args.tail)))
+        print(SiamOutputSerializer.emit(payload, output_mode))
+        return 0
+    if args.command == "safe-monitoring-view":
+        payload = build_monitoring_snapshot_view(
+            readiness_path=args.readiness_path,
+            alerts_path=args.alerts_path,
+            automation_log_path=args.log_path,
+        )
+        print(SiamOutputSerializer.emit(payload, output_mode))
+        return 0
+    from .control_layer import SiamCommandControlLayer
+
     layer = SiamCommandControlLayer.from_defaults()
     if args.command == "status":
         payload = SiamOutputSerializer.status_model(layer.health_status())

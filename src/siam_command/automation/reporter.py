@@ -4,21 +4,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 from collections import deque
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Tuple
 
-from ..application.ports import ControlPlanePorts
-from ..infrastructure.settings import SiamInfrastructureSettings
-
 try:
     from .snapshot_exporter import export_all_snapshots
 except ImportError:  # pragma: no cover - direct script execution fallback
-    repo_root = Path(__file__).resolve().parents[3]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    from src.siam_command.automation.snapshot_exporter import export_all_snapshots  # type: ignore
+    def export_all_snapshots(**_: Any) -> Dict[str, Any]:
+        return {"ok": False}
 
 
 DEFAULT_READINESS_SNAPSHOT_PATH = ".siam/readiness_snapshot.json"
@@ -125,8 +119,8 @@ def run_reporter(
     path: str,
     tail: int = 5,
     *,
-    ports: ControlPlanePorts | None = None,
-    settings: SiamInfrastructureSettings | None = None,
+    ports: Any = None,
+    settings: Any = None,
 ) -> None:
     try:
         with open(path, "r", encoding="utf-8"):

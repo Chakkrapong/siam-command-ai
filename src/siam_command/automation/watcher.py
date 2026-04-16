@@ -7,21 +7,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
-from ..application.ports import ControlPlanePorts
-from ..infrastructure.settings import SiamInfrastructureSettings
-
 try:
     from .snapshot_exporter import export_all_snapshots
 except ImportError:  # pragma: no cover - direct script execution fallback
-    repo_root = Path(__file__).resolve().parents[3]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    from src.siam_command.automation.snapshot_exporter import export_all_snapshots  # type: ignore
+    def export_all_snapshots(**_: Any) -> Dict[str, Any]:
+        return {"ok": False}
 
 
 DEFAULT_READINESS_SNAPSHOT_PATH = ".siam/readiness_snapshot.json"
@@ -125,8 +119,8 @@ def _process_entries(entries: Iterable[Dict[str, Any]]) -> tuple[int, int]:
 def _refresh_monitoring_snapshots(
     log_path: str,
     *,
-    ports: ControlPlanePorts | None = None,
-    settings: SiamInfrastructureSettings | None = None,
+    ports: Any = None,
+    settings: Any = None,
 ) -> None:
     """Best-effort snapshot export hook; never blocks watcher flow."""
     result = export_all_snapshots(
@@ -147,8 +141,8 @@ def _refresh_monitoring_snapshots(
 def run_watcher(
     path: str,
     *,
-    ports: ControlPlanePorts | None = None,
-    settings: SiamInfrastructureSettings | None = None,
+    ports: Any = None,
+    settings: Any = None,
 ) -> None:
     """Run the watcher over the full log file and print results."""
     total_entries, total_signals = _process_entries(read_log_lines(path))
@@ -164,8 +158,8 @@ def run_watcher_loop(
     path: str,
     interval_seconds: float = 10,
     *,
-    ports: ControlPlanePorts | None = None,
-    settings: SiamInfrastructureSettings | None = None,
+    ports: Any = None,
+    settings: Any = None,
 ) -> None:
     """Continuously poll log file and process only newly appended entries."""
     offset = 0

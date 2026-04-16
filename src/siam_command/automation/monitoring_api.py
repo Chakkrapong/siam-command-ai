@@ -6,10 +6,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..application.ports import ControlPlanePorts
-from ..infrastructure.bootstrap import build_control_plane_ports
-from ..infrastructure.settings import SiamInfrastructureSettings
-
 DEFAULT_READINESS_SNAPSHOT_PATH = ".siam/readiness_snapshot.json"
 DEFAULT_ALERTS_SNAPSHOT_PATH = ".siam/alerts_snapshot.json"
 _DEFAULT_SCOPE_TYPE = "global"
@@ -145,15 +141,12 @@ def coerce_alerts_snapshot(payload: Any) -> dict[str, Any]:
 def get_readiness_snapshot_response(
     path: str | Path = DEFAULT_READINESS_SNAPSHOT_PATH,
     *,
-    ports: ControlPlanePorts | None = None,
-    settings: SiamInfrastructureSettings | None = None,
+    ports: Any = None,
+    settings: Any = None,
 ) -> dict[str, Any]:
-    resolved_ports = ports
-    resolved_settings = settings or SiamInfrastructureSettings.from_env()
-    if resolved_ports is None and resolved_settings.readiness_provider.strip().lower() != "local":
-        resolved_ports = build_control_plane_ports(resolved_settings)
-    if resolved_ports is not None:
-        latest = resolved_ports.readiness.get_latest_snapshot(_DEFAULT_SCOPE_TYPE, _DEFAULT_SCOPE_KEY)
+    _ = settings
+    if ports is not None and hasattr(ports, "readiness"):
+        latest = ports.readiness.get_latest_snapshot(_DEFAULT_SCOPE_TYPE, _DEFAULT_SCOPE_KEY)
         if isinstance(latest, dict):
             return coerce_readiness_snapshot(latest)
     return coerce_readiness_snapshot(read_json_file(path))
@@ -162,15 +155,12 @@ def get_readiness_snapshot_response(
 def get_alerts_snapshot_response(
     path: str | Path = DEFAULT_ALERTS_SNAPSHOT_PATH,
     *,
-    ports: ControlPlanePorts | None = None,
-    settings: SiamInfrastructureSettings | None = None,
+    ports: Any = None,
+    settings: Any = None,
 ) -> dict[str, Any]:
-    resolved_ports = ports
-    resolved_settings = settings or SiamInfrastructureSettings.from_env()
-    if resolved_ports is None and resolved_settings.alert_provider.strip().lower() != "local":
-        resolved_ports = build_control_plane_ports(resolved_settings)
-    if resolved_ports is not None:
-        alerts = resolved_ports.alerts.list_open_alerts(scope_type=_DEFAULT_SCOPE_TYPE, scope_key=_DEFAULT_SCOPE_KEY)
+    _ = settings
+    if ports is not None and hasattr(ports, "alerts"):
+        alerts = ports.alerts.list_open_alerts(scope_type=_DEFAULT_SCOPE_TYPE, scope_key=_DEFAULT_SCOPE_KEY)
         return coerce_alerts_snapshot(
             {
                 "alerts": alerts,
@@ -185,8 +175,8 @@ def get_monitoring_bundle_response(
     readiness_path: str | Path = DEFAULT_READINESS_SNAPSHOT_PATH,
     alerts_path: str | Path = DEFAULT_ALERTS_SNAPSHOT_PATH,
     *,
-    ports: ControlPlanePorts | None = None,
-    settings: SiamInfrastructureSettings | None = None,
+    ports: Any = None,
+    settings: Any = None,
 ) -> dict[str, Any]:
     return {
         "readiness": get_readiness_snapshot_response(readiness_path, ports=ports, settings=settings),
